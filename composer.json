@@ -1,0 +1,47 @@
+{
+  "name": "snappedcut/sdk",
+  "description": "PHP SDK for the Snapped Cut cloud render API (no Composer dependencies).",
+  "type": "library",
+  "license": "MIT",
+  "keywords": [
+    "snappedcut",
+    "video",
+    "render",
+    "webcodecs",
+    "sdk"
+  ],
+  "homepage": "https://snappedcut.com",
+  "support": {
+    "docs": "https://snappedcut.com/docs",
+    "issues": "https://github.com/snappedcut-dev/sdk-php/issues",
+    "source": "https://github.com/snappedcut-dev/sdk-php"
+  },
+  "require": {
+    "php": ">=8.1",
+    "ext-curl": "*",
+    "ext-json": "*"
+  },
+  "require-dev": {
+    "phpunit/phpunit": "^11.5",
+    "phpstan/phpstan": "^2.2",
+    "friendsofphp/php-cs-fixer": "^3.64"
+  },
+  "autoload": {
+    "psr-4": {
+      "SnappedCut\\": "src/"
+    }
+  },
+  "autoload-dev": {
+    "psr-4": {
+      "SnappedCut\\Tests\\": "tests/"
+    }
+  },
+  "scripts": {
+    "test": "phpunit",
+    "stan": "phpstan analyse",
+    "fmt": "php-cs-fixer fix --dry-run --diff"
+  },
+  "config": {
+    "sort-packages": true
+  }
+}
