@@ -22,6 +22,8 @@ final class SnappedCutError extends RuntimeException
         public readonly int $retryAfterMs = 0,
         /** On a 409 from a chunked upload: the byte the server's copy ends at. */
         public readonly int $expected = 0,
+        /** The body's `code`, when it has one. PHP's Exception already owns `$code`. */
+        public readonly ?string $errorCode = null,
     ) {
         parent::__construct($message, $status);
     }
@@ -34,5 +36,17 @@ final class SnappedCutError extends RuntimeException
     public function rateLimited(): bool
     {
         return $this->status === 429;
+    }
+
+    /** The name every Snapped Cut SDK uses for outOfCredits(). */
+    public function isOutOfCredits(): bool
+    {
+        return $this->outOfCredits();
+    }
+
+    /** The name every Snapped Cut SDK uses for rateLimited(). */
+    public function isRateLimited(): bool
+    {
+        return $this->rateLimited();
     }
 }

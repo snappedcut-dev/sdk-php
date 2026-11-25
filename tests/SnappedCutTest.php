@@ -274,4 +274,208 @@ final class SnappedCutTest extends TestCase
         $snapcut = new SnappedCut('k', transport: $this->transport([[200, '{}']]));
         self::assertSame([], $snapcut->jobs());
     }
+
+    // -- 0.2.0: JSON jobs, uploads, webhooks ------------------------------
+
+    private const WEBHOOK_SECRET = 'whsec_snapcut_test';
+
+    private const WEBHOOK_BODY = '{"id":"evt_1","type":"job.succeeded"}';
+
+    private const WEBHOOK_HEADER = 't=1760000000000,v1=54c2adf2a351242de19b156794d65c56bebf9fc56cadac990c56b979a7a61ab2';
+
+    public function testTheFixedWebhookVector(): void
+    {
+        self::assertTrue(SnappedCut::verifyWebhook(self::WEBHOOK_SECRET, self::WEBHOOK_BODY, self::WEBHOOK_HEADER, 1760000001000));
+        // Outside five minutes.
+        self::assertFalse(SnappedCut::verifyWebhook(self::WEBHOOK_SECRET, self::WEBHOOK_BODY, self::WEBHOOK_HEADER, 1760000400000));
+        // One trailing space is a different body.
+        self::assertFalse(SnappedCut::verifyWebhook(self::WEBHOOK_SECRET, self::WEBHOOK_BODY . ' ', self::WEBHOOK_HEADER, 1760000001000));
+    }
+
+    public function testAMalformedSignatureIsFalseNotAnError(): void
+    {
+        $v1Only = substr(self::WEBHOOK_HEADER, strlen('t=1760000000000,'));
+        self::assertFalse(SnappedCut::verifyWebhook(self::WEBHOOK_SECRET, self::WEBHOOK_BODY, $v1Only, 1760000001000));
+        self::assertFalse(SnappedCut::verifyWebhook(self::WEBHOOK_SECRET, self::WEBHOOK_BODY, strtoupper(self::WEBHOOK_HEADER), 1760000001000));
+        self::assertFalse(SnappedCut::verifyWebhook(self::WEBHOOK_SECRET, self::WEBHOOK_BODY, null, 1760000001000));
+    }
+
+    public function testCreateJobSendsTheKeyTheIdempotencyKeyAndJson(): void
+    {
+        $snapcut = new SnappedCut('sk_snapcut_test', transport: $this->transport([
+            [201, '{"job":{"id":"j1","state":"queued","newField":1},"charged":3,"price":3,"credits":97,"idempotent":false}'],
+        ]));
+        $created = $snapcut->createJob(['design' => ['clips' => []], 'format' => 'mp4'], 'order-42');
+
+        $call = $this->calls[0];
+        self::assertSame('POST', $call['method']);
+        self::assertSame('https://snappedcut.com/api/jobs', $call['url']);
+        self::assertSame('Bearer sk_snapcut_test', $call['headers']['authorization']);
+        self::assertSame('order-42', $call['headers']['idempotency-key']);
+        self::assertSame('application/json', $call['headers']['content-type']);
+        self::assertSame('snappedcut-php/0.2.0', $call['headers']['user-agent']);
+        self::assertSame(['design' => ['clips' => []], 'format' => 'mp4'], json_decode((string) $call['body'], true));
+        self::assertSame(3, $created['charged']);
+    }
+
+    public function testCreateJobWithoutAKeySendsNoIdempotencyHeader(): void
+    {
+        $snapcut = new SnappedCut('k', transport: $this->transport([[201, '{}']]));
+        $snapcut->createJob(['bundle' => 'ast_1']);
+
+        self::assertArrayNotHasKey('idempotency-key', $this->calls[0]['headers']);
+    }
+
+    public function testA402FromCreateJobIsOutOfCredits(): void
+    {
+        $snapcut = new SnappedCut('k', transport: $this->transport([
+            [402, '{"error":"Not enough credits.","retryAfterMs":0}'],
+        ]));
+
+        try {
+            $snapcut->createJob(['bundle' => 'ast_1']);
+            self::fail('expected a refusal');
+        } catch (SnappedCutError $error) {
+            self::assertTrue($error->isOutOfCredits());
+            self::assertFalse($error->isRateLimited());
+            self::assertSame(402, $error->status);
+            self::assertSame('Not enough credits.', $error->getMessage());
+            self::assertSame(0, $error->retryAfterMs);
+            self::assertNull($error->errorCode);
+        }
+    }
+
+    public function testAnErrorCodeIsCarried(): void
+    {
+        $snapcut = new SnappedCut('k', transport: $this->transport([
+            [429, '{"error":"Slow down.","retryAfterMs":1500,"code":"rate_limited"}'],
+        ]));
+
+        try {
+            $snapcut->account();
+            self::fail('expected a refusal');
+        } catch (SnappedCutError $error) {
+            self::assertTrue($error->isRateLimited());
+            self::assertSame('rate_limited', $error->errorCode);
+        }
+    }
+
+    public function testUploadPutsTwoChunksWithoutTheKeyThenConfirms(): void
+    {
+        $snapcut = new SnappedCut('sk_snapcut_test', transport: $this->transport([
+            [201, '{"assetId":"ast_1","upload":{"method":"PUT","url":"https://up.example.test/api/uploads/ast_1?token=tok","maxChunkBytes":4}}'],
+            [200, '{"assetId":"ast_1","received":4}'],
+            [200, '{"assetId":"ast_1","received":6}'],
+            [200, '{"asset":{"id":"ast_1","confirmed":true}}'],
+        ]));
+        $asset = $snapcut->upload('abcdef', 'video/webm', 'clip.webm');
+
+        self::assertCount(4, $this->calls);
+        self::assertSame(['contentType' => 'video/webm', 'name' => 'clip.webm'], json_decode((string) $this->calls[0]['body'], true));
+        self::assertSame('PUT', $this->calls[1]['method']);
+        self::assertSame('https://up.example.test/api/uploads/ast_1?token=tok&offset=0', $this->calls[1]['url']);
+        self::assertSame('abcd', $this->calls[1]['body']);
+        self::assertSame('https://up.example.test/api/uploads/ast_1?token=tok&offset=4', $this->calls[2]['url']);
+        self::assertSame('ef', $this->calls[2]['body']);
+        // The upload URL carries its own permission.
+        self::assertArrayNotHasKey('authorization', $this->calls[1]['headers']);
+        self::assertArrayNotHasKey('authorization', $this->calls[2]['headers']);
+        self::assertSame('https://snappedcut.com/api/uploads/ast_1/confirm', $this->calls[3]['url']);
+        self::assertSame('{}', $this->calls[3]['body']);
+        self::assertTrue($asset['confirmed']);
+    }
+
+    public function testUploadReadsAStreamAChunkAtATime(): void
+    {
+        $stream = fopen('php://temp', 'r+b');
+        self::assertIsResource($stream);
+        fwrite($stream, 'abcdef');
+
+        $snapcut = new SnappedCut('k', transport: $this->transport([
+            [201, '{"assetId":"ast_2","upload":{"url":"https://up.example.test/u?token=x","maxChunkBytes":4}}'],
+            [200, '{}'],
+            [200, '{}'],
+            [200, '{"asset":{"id":"ast_2"}}'],
+        ]));
+        $snapcut->upload($stream, 'video/webm');
+
+        self::assertSame('abcd', $this->calls[1]['body']);
+        self::assertStringEndsWith('&offset=4', $this->calls[2]['url']);
+        self::assertSame('ef', $this->calls[2]['body']);
+    }
+
+    public function testWaitForJobReturnsTheJobOnDoneAndBacksOff(): void
+    {
+        $snapcut = new SnappedCut('k', transport: $this->transport([
+            [200, self::job('queued')],
+            [200, self::job('running')],
+            [200, self::job('done')],
+        ]));
+
+        $slept = [];
+        $job = $snapcut->waitForJob('j1', sleep: static function (float $s) use (&$slept): void {
+            $slept[] = $s;
+        });
+
+        self::assertSame('done', $job['state']);
+        self::assertSame([1.0, 1.5], $slept);
+        self::assertCount(3, $this->calls);
+    }
+
+    public function testWaitForJobThrowsTheJobErrorOnFailed(): void
+    {
+        $snapcut = new SnappedCut('k', transport: $this->transport([
+            [200, self::job('failed', 'Decode failed.')],
+        ]));
+
+        $this->expectException(SnappedCutError::class);
+        $this->expectExceptionMessage('Decode failed.');
+        $snapcut->waitForJob('j1', sleep: static function (float $s): void {});
+    }
+
+    public function testDownloadOutputSendsAnIndexOnlyAboveZero(): void
+    {
+        $snapcut = new SnappedCut('k', transport: $this->transport([[200, 'A'], [200, 'B']]));
+
+        self::assertSame('A', $snapcut->downloadOutput('j1'));
+        self::assertSame('B', $snapcut->downloadOutput('j1', 1));
+        self::assertStringEndsWith('/api/jobs/j1/output', $this->calls[0]['url']);
+        self::assertStringEndsWith('/api/jobs/j1/output?index=1', $this->calls[1]['url']);
+    }
+
+    public function testUsageOmitsAbsentParams(): void
+    {
+        $snapcut = new SnappedCut('k', transport: $this->transport([[200, '{}']]));
+        $snapcut->usage(from: 10, groupBy: 'day');
+
+        self::assertStringEndsWith('/api/usage?from=10&groupBy=day', $this->calls[0]['url']);
+    }
+
+    public function testAFailedDestinationTestIsAnAnswer(): void
+    {
+        $snapcut = new SnappedCut('k', transport: $this->transport([
+            [422, '{"ok":false,"key":"k","error":"Denied."}'],
+        ]));
+
+        self::assertFalse($snapcut->testDestination('d1')['ok']);
+    }
+
+    public function testUpdateWebhookSendsOnlyWhatChanged(): void
+    {
+        $snapcut = new SnappedCut('k', transport: $this->transport([
+            [200, '{"webhook":{"id":"w1","enabled":false}}'],
+        ]));
+        $webhook = $snapcut->updateWebhook('w1', enabled: false);
+
+        self::assertSame('PATCH', $this->calls[0]['method']);
+        self::assertSame('{"enabled":false}', $this->calls[0]['body']);
+        self::assertFalse($webhook['enabled']);
+    }
+
+    public function testRotateWebhookReturnsTheNewSecret(): void
+    {
+        $snapcut = new SnappedCut('k', transport: $this->transport([[200, '{"secret":"whsec_new"}']]));
+
+        self::assertSame('whsec_new', $snapcut->rotateWebhook('w1'));
+    }
 }

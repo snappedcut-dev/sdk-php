@@ -8,11 +8,50 @@ so it drops into a legacy app without dragging a tree behind it.
 composer require snappedcut/sdk
 ```
 
+## Quick start
+
 ```php
 use SnappedCut\SnappedCut;
 
-$snapcut = new SnappedCut();                     // reads SNAPCUT_KEY
+$snapcut = new SnappedCut();                                  // reads SNAPCUT_KEY
+$clip = $snapcut->upload(fopen('intro.webm', 'rb'), 'video/webm', 'intro.webm');
+$design = ['width' => 1920, 'height' => 1080, 'clips' => [
+    ['type' => 'video', 'asset' => $clip['id']],
+    ['type' => 'text', 'text' => 'Hello', 'start' => 0, 'duration' => 3],
+]];
+$created = $snapcut->renderDesign($design, ['outputs' => [
+    ['format' => 'mp4', 'preset' => 'landscape'],
+    ['format' => 'webm', 'preset' => 'vertical'],
+]], 'order-42');  // Idempotency-Key: a retry returns this job, not a second charge
+$job = $snapcut->waitForJob($created['job']['id']);
+file_put_contents('out.mp4', $snapcut->downloadOutput($job['id'], 0));
+file_put_contents('out.webm', $snapcut->downloadOutput($job['id'], 1));
+```
 
+Presets: `source`, `vertical`, `square`, `portrait`, `landscape`, `hd720`,
+`uhd2160`. The JSON calls return the decoded response as arrays, so a field the
+API adds later just appears.
+
+### Verifying webhooks
+
+```php
+$ok = SnappedCut::verifyWebhook(
+    getenv('SNAPCUT_WEBHOOK_SECRET'),
+    file_get_contents('php://input'),               // the raw body, before decoding
+    $_SERVER['HTTP_X_SNAPPEDCUT_SIGNATURE'] ?? null,
+);
+if (!$ok) {
+    http_response_code(400);
+    exit;
+}
+```
+
+The header is `t=<epoch ms>,v1=<hex HMAC-SHA256 of "t.body">`; anything more
+than five minutes old is refused, and the comparison is constant time.
+
+### Rendering a bundle
+
+```php
 $job = $snapcut->render(fopen('project.zip', 'rb'));
 printf("charged %d credits for %gs\n", $job->charged, $job->priced->seconds);
 
@@ -32,6 +71,16 @@ like `sk_snapcut_…`. Keep it out of your document root; it spends credits.
 | `job($id)` / `jobs()` | One `Job`, or every job on the account. |
 | `output($id)` | The rendered bytes. Throws unless the job is done. |
 | `wait($id, $timeout, $onState, $sleep)` | Polls to completion, returns the bytes. |
+| `createJob($request, $idempotencyKey)` / `createBatch($jobs, $defaults)` | A JSON job (design, uploaded bundle, or tool), or up to 100 at once. |
+| `getJob($id)` / `listJobs()` / `downloadOutput($id, $index)` | The JSON job(s); one output's bytes. |
+| `waitForJob($id, $timeout, $sleep)` | Polls from 1 s, x1.5, capped at 15 s; returns the job on `done`, throws on `failed`. |
+| `compileDesign($design, $vars)` / `renderDesign($design, $options, $idempotencyKey)` | A design to project.json, or straight to a job. |
+| `upload($data, $contentType, $name)` / `getAsset($id)` / `deleteAsset($id)` | Direct uploads in chunks; the key is never sent to the upload URL. |
+| `operations()` / `usage($from, $to, $endUserId, $groupBy)` / `deleteEndUser($id)` | What the API can do; what you spent. |
+| `createEmbedToken($pk, $endUserId, ...)` | An embed session token for one of your users. |
+| `listDestinations()`, `createDestination()`, `getDestination()`, `updateDestination()`, `deleteDestination()`, `testDestination()`, `presignDestination()` | Storage destinations. A failed test is an answer (`ok: false`), not a throw. |
+| `listWebhooks()`, `createWebhook()`, `getWebhook()`, `updateWebhook()`, `deleteWebhook()`, `rotateWebhook()`, `webhookDeliveries()`, `testWebhook()` | Webhook endpoints. |
+| `SnappedCut::verifyWebhook($secret, $rawBody, $header, $nowMs)` | Static. True only for a fresh, matching signature. |
 
 ## Pass a stream for anything large
 
@@ -68,8 +117,11 @@ actually charged is in `charged`, with the server's reasoning in `priced`.
 
 ## Errors
 
-Every failure throws `SnappedCutError` with the HTTP `status` on it, and the two
-failures you actually branch on have methods so you need not parse a message:
+Every failure throws `SnappedCutError` with the HTTP `status` on it, plus
+`retryAfterMs` and `errorCode` (the body's `code`; PHP's Exception already owns
+`$code`). The two failures you actually branch on have methods so you need not
+parse a message (`isOutOfCredits()` and `isRateLimited()` are the same checks
+under the names every Snapped Cut SDK uses):
 
 ```php
 use SnappedCut\SnappedCutError;
